@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004-2010 Apple, Inc. All rights reserved.
+ * Copyright (c) 2004-2019 Apple, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -61,16 +61,16 @@
 #define qtn_file_t void *
 #define QTN_SERIALIZED_DATA_MAX 0
 static void * qtn_file_alloc(void) { return NULL; }
-static int qtn_file_init_with_fd(void *x, int y) { return -1; }
-static int qtn_file_init_with_path(void *x, const char *path) { return -1; }
-static int qtn_file_init_with_data(void *x, const void *data, size_t len) { return -1; }
-static void qtn_file_free(void *x) { return; }
-static int qtn_file_apply_to_fd(void *x, int y) { return 0; }
-static char *qtn_error(int x) { return NULL; }
-static int qtn_file_to_data(void *x, char *y, size_t z) { return -1; }
-static void *qtn_file_clone(void *x) { return NULL; }
-static uint32_t qtn_file_get_flags(void *x) { return 0; }
-static int qtn_file_set_flags(void *x, uint32_t flags) { return 0; }
+static int qtn_file_init_with_fd(__unused void *x, __unused int y) { return -1; }
+static int qtn_file_init_with_path(__unused void *x, __unused const char *path) { return -1; }
+static int qtn_file_init_with_data(__unused void *x, __unused const void *data, __unused size_t len) { return -1; }
+static void qtn_file_free(__unused void *x) { return; }
+static int qtn_file_apply_to_fd(__unused void *x, __unused int y) { return 0; }
+static char *qtn_error(__unused int x) { return NULL; }
+static int qtn_file_to_data(__unused void *x, __unused char *y, __unused size_t *z) { return -1; }
+static void *qtn_file_clone(__unused void *x) { return NULL; }
+static uint32_t qtn_file_get_flags(__unused void *x) { return 0; }
+static int qtn_file_set_flags(__unused void *x, __unused uint32_t flags) { return 0; }
 #define	XATTR_QUARANTINE_NAME "figgledidiggledy"
 #define QTN_FLAG_DO_NOT_TRANSLOCATE 0
 #endif /* TARGET_OS_IPHONE */
@@ -78,6 +78,8 @@ static int qtn_file_set_flags(void *x, uint32_t flags) { return 0; }
 #include "copyfile.h"
 #include "copyfile_private.h"
 #include "xattr_flags.h"
+
+#define XATTR_ROOT_INSTALLED_NAME "com.apple.root.installed"
 
 enum cfInternalFlags {
 	cfDelayAce                = 1 << 0, /* set if ACE shouldn't be set until post-order traversal */
@@ -235,7 +237,7 @@ sort_xattrname_list(void *start, size_t length)
 
 	tmp = ptrs[indx++] = (char*)start;
 
-	while (tmp = memchr(tmp, 0, ((char*)start + length) - tmp)) {
+	while ((tmp = memchr(tmp, 0, ((char*)start + length) - tmp))) {
 		if (indx == nel) {
 			nel += 10;
 			ptrs = realloc(ptrs, sizeof(char**) * nel);
@@ -607,6 +609,10 @@ reset_security(copyfile_state_t s)
  * copytree() is called from copyfile() -- but copytree() itself then calls
  * copyfile() to copy each individual object.
  *
+ * If COPYFILE_CLONE is passed, copytree() will clone (instead of copy)
+ * regular files and symbolic links found in each directory.
+ * Directories will still be copied normally.
+ *
  * XXX - no effort is made to handle overlapping hierarchies at the moment.
  *
  */
@@ -639,13 +645,13 @@ copytree(copyfile_state_t s)
 		retval = -1;
 		goto done;
 	}
-	if (s->flags & (COPYFILE_MOVE | COPYFILE_UNLINK | COPYFILE_CHECK | COPYFILE_PACK | COPYFILE_UNPACK)) {
+	if (s->flags & (COPYFILE_MOVE | COPYFILE_UNLINK | COPYFILE_CHECK | COPYFILE_PACK | COPYFILE_UNPACK | COPYFILE_CLONE_FORCE)) {
 		errno = EINVAL;
 		retval = -1;
 		goto done;
 	}
 
-	flags = s->flags & (COPYFILE_ALL | COPYFILE_NOFOLLOW | COPYFILE_VERBOSE | COPYFILE_EXCL);
+	flags = s->flags & (COPYFILE_ALL | COPYFILE_NOFOLLOW | COPYFILE_VERBOSE | COPYFILE_EXCL | COPYFILE_CLONE | COPYFILE_DATA_SPARSE);
 
 	paths[0] = src = s->src;
 	dst = s->dst;
@@ -739,8 +745,9 @@ copytree(copyfile_state_t s)
 
 	// COPYFILE_RECURSIVE is always done physically: see 11717978.
 	fts_flags |= FTS_PHYSICAL;
-	if (!(s->flags & COPYFILE_NOFOLLOW_SRC)) {
-		// Follow 'src', even if it's a symlink.
+	if (!(s->flags & (COPYFILE_NOFOLLOW_SRC|COPYFILE_CLONE))) {
+		// Follow 'src', even if it's a symlink, unless instructed not to
+		// or we're cloning, where we never follow symlinks.
 		fts_flags |= FTS_COMFOLLOW;
 	}
 
@@ -829,6 +836,8 @@ copytree(copyfile_state_t s)
 					goto stopit;
 				}
 			}
+			// Since we don't support cloning directories this code depends on copyfile()
+			// falling back to a regular directory copy.
 			int tmp_flags = (cmd == COPYFILE_RECURSE_DIR) ? (flags & ~COPYFILE_STAT) : flags;
 			rv = copyfile(ftsent->fts_path, dstfile, tstate, tmp_flags);
 			if (rv < 0) {
@@ -1005,21 +1014,18 @@ int fcopyfile(int src_fd, int dst_fd, copyfile_state_t state, copyfile_flags_t f
  * however, in case of best try flag, we fallback to the copy method.
  */
 
-static int copyfile_clone(const char *src, const char *dst, copyfile_state_t state, copyfile_flags_t flags)
+static int copyfile_clone(copyfile_state_t state)
 {
 	int ret = 0;
-	int cloneFlags = 0;
+	// Since we don't allow cloning of directories, we must also forbid
+	// cloning the target of symlinks (since that may be a directory).
+	int cloneFlags = CLONE_NOFOLLOW;
 	struct stat src_sb;
 
-	if (lstat(src, &src_sb) != 0)
+	if (lstat(state->src, &src_sb) != 0)
 	{
 		errno = EINVAL;
 		return -1;
-	}
-
-	if (COPYFILE_NOFOLLOW & flags)
-	{
-		cloneFlags = CLONE_NOFOLLOW;
 	}
 
 	/*
@@ -1033,14 +1039,14 @@ static int copyfile_clone(const char *src, const char *dst, copyfile_state_t sta
 		 * before we create it.  We don't care if the file doesn't
 		 * exist, so we ignore ENOENT.
 		 */
-		if (flags & COPYFILE_UNLINK)
+		if (state->flags & COPYFILE_UNLINK)
 		{
-			if (remove(dst) < 0 && errno != ENOENT)
+			if (remove(state->dst) < 0 && errno != ENOENT)
 			{
 				return -1;
 			}
 		}
-		ret = clonefileat(AT_FDCWD, src, AT_FDCWD, dst, cloneFlags);
+		ret = clonefileat(AT_FDCWD, state->src, AT_FDCWD, state->dst, cloneFlags);
 		if (ret == 0) {
 			/*
 			 * We could also report the size of the single
@@ -1051,16 +1057,15 @@ static int copyfile_clone(const char *src, const char *dst, copyfile_state_t sta
 			 * and let the caller figure out how they want to
 			 * deal.
 			 */
-			if (state != NULL)
-				state->was_cloned = true;
+			state->was_cloned = true;
 
 			/*
 			 * COPYFILE_MOVE tells us to attempt removing
 			 * the source file after the copy, and to
 			 * ignore any errors returned by remove(3).
 			 */
-			if (flags & COPYFILE_MOVE) {
-				(void)remove(src);
+			if (state->flags & COPYFILE_MOVE) {
+				(void)remove(state->src);
 			}
 		}
 	}
@@ -1091,21 +1096,6 @@ int copyfile(const char *src, const char *dst, copyfile_state_t state, copyfile_
 		return -1;
 	}
 
-	if (flags & (COPYFILE_CLONE_FORCE | COPYFILE_CLONE))
-	{
-		ret = copyfile_clone(src, dst, state, flags);
-		if (ret == 0) {
-			goto exit;
-		} else if (flags & COPYFILE_CLONE_FORCE) {
-			goto error_exit;
-		}
-		// cloning failed. Inherit clonefile flags required for
-		// falling back to copyfile.
-		flags = flags |  (COPYFILE_EXCL | COPYFILE_ACL |
-						  COPYFILE_STAT | COPYFILE_XATTR | COPYFILE_DATA);
-		flags = flags & (~COPYFILE_CLONE);
-	}
-	ret = 0;
 	if (copyfile_preamble(&s, flags) < 0)
 	{
 		return -1;
@@ -1147,6 +1137,24 @@ int copyfile(const char *src, const char *dst, copyfile_state_t state, copyfile_
 	if (s->flags & COPYFILE_RECURSIVE) {
 		ret = copytree(s);
 		goto exit;
+	}
+
+	if (s->flags & (COPYFILE_CLONE_FORCE | COPYFILE_CLONE))
+	{
+		ret = copyfile_clone(s);
+		if (ret == 0) {
+			goto exit;
+		} else if (s->flags & COPYFILE_CLONE_FORCE) {
+			goto error_exit;
+		}
+		// cloning failed. Inherit clonefile flags required for
+		// falling back to copyfile.
+		s->flags |= (COPYFILE_ACL | COPYFILE_EXCL | COPYFILE_NOFOLLOW_SRC |
+					 COPYFILE_STAT | COPYFILE_XATTR | COPYFILE_DATA);
+
+		s->flags &= ~COPYFILE_CLONE;
+		flags = s->flags;
+		ret = 0;
 	}
 
 	/*
@@ -1416,7 +1424,7 @@ static int copyfile_internal(copyfile_state_t s, copyfile_flags_t flags)
 	 * the non-meta data portion of the file.  We attempt to
 	 * remove (via unlink) the destination file if we fail.
 	 */
-	if (COPYFILE_DATA & flags)
+	if ((COPYFILE_DATA|COPYFILE_DATA_SPARSE) & flags)
 	{
 		if ((ret = copyfile_data(s)) < 0)
 		{
@@ -2020,6 +2028,297 @@ static copyfile_flags_t copyfile_check(copyfile_state_t s)
 }
 
 /*
+ * Attempt to copy the data section of a file sparsely.
+ * Requires that the source and destination file systems support sparse files.
+ * Also requires that the source file descriptor's offset is a multiple of the smaller of the
+ * source and destination file systems' block size.
+ * In practice, this means that we refuse to perform copies that are only partially sparse.
+ * Returns 0 if the source sparse file was copied, -1 on an unrecoverable error that
+ * callers should propagate, and ENOTSUP where this routine refuses to copy the source file.
+ * In this final case, callers are free to attempt a full copy.
+ */
+static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_t output_blk_size)
+{
+	int src_fd = s->src_fd, dst_fd = s->dst_fd, rc = 0;
+	off_t src_start, dst_start, src_size = s->sb.st_size;
+	off_t first_hole_offset, next_hole_offset, current_src_offset, next_src_offset;
+	ssize_t nread;
+	size_t iosize = MIN(input_blk_size, output_blk_size);
+	copyfile_callback_t status = s->statuscb;
+	char *bp = NULL;
+	bool use_punchhole = true;
+	errno = 0;
+
+	// Sanity checks.
+	if (!(s->flags & COPYFILE_DATA_SPARSE)) {
+		// Don't attempt this unless the right flags are passed.
+		return ENOTSUP;
+	} else if (src_size <= 0) {
+		// The file size of our source is invalid; there's nothing to copy.
+		errno = EINVAL;
+		goto error_exit;
+	}
+
+	// Since a major underlying filesystem requires that holes are block-aligned,
+	// we only punch holes if we can guarantee that all holes from the source can
+	// be holes in the destination, which requires that the source filesystem's block size
+	// be an integral multiple of the destination filesystem's block size.
+	if (input_blk_size % output_blk_size != 0) {
+		use_punchhole = false;
+	}
+
+	// Get the starting src/dest file descriptor offsets.
+	src_start = lseek(src_fd, 0, SEEK_CUR);
+	dst_start = lseek(dst_fd, 0, SEEK_CUR);
+	if (src_start < 0 || src_start >= src_size || dst_start < 0) {
+		/*
+		 * Invalid starting source/destination offset:
+		 * Either < 0 which is plainly invalid (lseek may have failed),
+		 * or > EOF which means that the copy operation is undefined,
+		 * as by definition there is no data past EOF.
+		 */
+		if (errno == 0) {
+			errno = EINVAL;
+		}
+		copyfile_warn("Invalid file descriptor offset, cannot perform a sparse copy");
+		goto error_exit;
+	} else if (src_start != (off_t) roundup(src_start, iosize) ||
+			   dst_start != (off_t) roundup(dst_start, iosize)) {
+		// If the starting offset isn't a multiple of the iosize, we can't do an entire sparse copy.
+		// Fall back to copyfile_data(), which will perform a full copy from the starting position.
+		return ENOTSUP;
+	}
+
+	// Make sure that there is at least one hole in this [part of the] file.
+	first_hole_offset = lseek(src_fd, src_start, SEEK_HOLE);
+	if (first_hole_offset == -1 || first_hole_offset == src_size) {
+		/*
+		 * Either an error occurred, the src starting position is EOF, or there are no
+		 * holes in this [portion of the] source file. Regardless, we rewind the source file
+		 * and return ENOTSUP so copyfile_data() can attempt a full copy.
+		 */
+		if (lseek(src_fd, src_start, SEEK_SET) == -1) {
+			goto error_exit;
+		}
+		return ENOTSUP;
+	}
+
+	// We are ready to begin copying.
+	// First, truncate the destination file to zero out any existing contents.
+	// Then, truncate it again to its eventual size.
+	if (ftruncate(dst_fd, dst_start) == -1) {
+		copyfile_warn("Could not zero destination file before copy");
+		goto error_exit;
+	} else if (ftruncate(dst_fd, dst_start + src_size - src_start) == -1) {
+		copyfile_warn("Could not set destination file size before copy");
+		goto error_exit;
+	}
+
+	// Set the source's offset to the first data section.
+	current_src_offset = lseek(src_fd, src_start, SEEK_DATA);
+	if (current_src_offset == -1) {
+		if (errno == ENXIO) {
+			// There are no more data sections in the file, so there's nothing to copy.
+			goto set_total_copied;
+		}
+		goto error_exit;
+	}
+
+	// Now, current_src_offset points at the start of src's first data region.
+	// Update dst_fd to point to the same offset (respecting its start).
+	if (lseek(dst_fd, dst_start + current_src_offset - src_start, SEEK_SET) == -1) {
+		copyfile_warn("failed to set dst to first data section");
+		goto error_exit;
+	}
+
+	// Allocate a temporary buffer to copy data sections into.
+	bp = malloc(iosize);
+	if (bp == NULL) {
+		copyfile_warn("No memory for copy buffer");
+		goto error_exit;
+	}
+
+	/*
+	 * Performing a sparse copy:
+	 * While our source fd points to a data section (and is < EOF), read iosize bytes in.
+	 * Then, write those bytes to the dest fd, using the same iosize.
+	 * Finally, update our source and dest fds to point to the next data section.
+	 */
+	while ((nread = read(src_fd, bp, iosize)) > 0) {
+		ssize_t nwritten;
+		size_t left = nread;
+		void *ptr = bp;
+		int loop = 0;
+
+		while (left > 0) {
+			nwritten = write(dst_fd, ptr, left);
+			switch (nwritten) {
+				case 0:
+					if (++loop > 5) {
+						copyfile_warn("writing to output %d times resulted in 0 bytes written", loop);
+						errno = EAGAIN;
+						goto error_exit;
+					}
+					break;
+				case -1:
+					copyfile_warn("writing to output file failed");
+					if (status) {
+						int rv = (*status)(COPYFILE_COPY_DATA, COPYFILE_ERR, s, s->src, s->dst, s->ctx);
+						if (rv == COPYFILE_SKIP) {	// Skip the data copy
+							errno = 0;
+							goto exit;
+						} else if (rv == COPYFILE_CONTINUE) {	// Retry the write
+							errno = 0;
+							continue;
+						}
+					}
+					// If we get here, we either have no callback or it didn't tell us to continue.
+					goto error_exit;
+					break;
+				default:
+					left -= nwritten;
+					ptr = ((char*)ptr) + nwritten;
+					loop = 0;
+					break;
+			}
+			s->totalCopied += nwritten;
+			if (status) {
+				int rv = (*status)(COPYFILE_COPY_DATA, COPYFILE_PROGRESS, s, s->src, s->dst, s->ctx);
+				if (rv == COPYFILE_QUIT) {
+					errno = ECANCELED;
+					goto error_exit;
+				}
+			}
+		}
+		current_src_offset += nread;
+
+		// Find the next area of src_fd to copy.
+		// Since data sections can be any length, we need see if current_src_offset points
+		// at a hole.
+		// If we get ENXIO, we're done copying (the last part of the file was a data section).
+		// If this is not a hole, we do not need to alter current_src_offset yet.
+		// If this is a hole, then we need to look for the next data section.
+		next_hole_offset = lseek(src_fd, current_src_offset, SEEK_HOLE);
+		if (next_hole_offset == -1) {
+			if (errno == ENXIO) {
+				break; // We're done copying data sections.
+			}
+			copyfile_warn("unable to find next hole in file during copy");
+			goto error_exit;
+		} else if (next_hole_offset != current_src_offset) {
+			// Keep copying this data section (we must rewind src_fd to current_src_offset).
+			if (lseek(src_fd, current_src_offset, SEEK_SET) == -1) {
+				goto error_exit;
+			}
+			continue;
+		}
+
+		// If we get here, we need to find the next data section to copy.
+		next_src_offset = lseek(src_fd, current_src_offset, SEEK_DATA);
+		if (next_src_offset == -1) {
+			if (errno == ENXIO) {
+				// There are no more data sections in this file, so we're done with the copy.
+				break;
+			}
+
+			copyfile_warn("unable to advance src to next data section");
+			goto error_exit;
+		}
+
+		// Advance the dst_fd to match (taking into account where it started).
+		if (lseek(dst_fd, dst_start + (next_src_offset - src_start), SEEK_SET) == -1) {
+			copyfile_warn("unable to advance dst to next data section");
+			goto error_exit;
+		}
+
+		current_src_offset = next_src_offset;
+	}
+	if (nread < 0) {
+		copyfile_warn("error %d reading from %s", errno, s->src ? s->src : "(null src)");
+		goto error_exit;
+	}
+
+	// Punch holes where possible if needed.
+	if (use_punchhole) {
+		struct fpunchhole punchhole_args;
+		off_t hole_start = first_hole_offset, hole_end;
+		bool trailing_hole = true;
+
+		// First, reset the source and destination file descriptors.
+		if (lseek(src_fd, src_start, SEEK_SET) == -1 || lseek(dst_fd, dst_start, SEEK_SET) == -1) {
+			copyfile_warn("unable to reset file descriptors to punch holes");
+			// We have still copied the data, so there's no need to return an error here.
+			goto set_total_copied;
+		}
+
+		// Now, find holes in the source (first_hole_offset already points to a source hole),
+		// determining their length by the presence of a data section.
+		while ((hole_end = lseek(src_fd, hole_start + (off_t) iosize, SEEK_DATA)) != -1) {
+			memset(&punchhole_args, 0, sizeof(punchhole_args));
+
+			// Fix up the offset and length for the destination file.
+			punchhole_args.fp_offset = hole_start - src_start + dst_start;
+			punchhole_args.fp_length = hole_end - hole_start;
+			if (fcntl(dst_fd, F_PUNCHHOLE, &punchhole_args) == -1) {
+				copyfile_warn("unable to punch hole in destination file, offset %lld length %lld",
+							  hole_start - src_start + dst_start, hole_end - hole_start);
+				goto set_total_copied;
+			}
+
+			// Now, find the start of the next hole.
+			hole_start = lseek(src_fd, hole_end, SEEK_HOLE);
+			if (hole_start == -1 || hole_start == src_size) {
+				// No more holes (or lseek failed), so break.
+				trailing_hole = false;
+				break;
+			}
+		}
+
+		if ((hole_end == -1 || hole_start == -1) && errno != ENXIO) {
+			// A call to lseek() failed. Hole punching is best effort, so exit.
+			copyfile_warn("lseek during hole punching failed");
+			goto set_total_copied;
+		}
+
+		// We will still have a trailing hole to punch if the last lseek(SEEK_HOLE) succeeded.
+		if (trailing_hole) {
+			// Since we can only punch iosize-aligned holes, we must make sure the last hole
+			// is iosize-aligned. Unfortunately, no good truncate macros are in scope here,
+			// so we must round down the end of the trailing hole to an iosize boundary ourselves.
+			hole_end = (src_size % iosize == 0) ? src_size : roundup(src_size, iosize) - iosize;
+
+			memset(&punchhole_args, 0, sizeof(punchhole_args));
+			punchhole_args.fp_offset = hole_start - src_start + dst_start;
+			punchhole_args.fp_length = hole_end - hole_start;
+			if (fcntl(dst_fd, F_PUNCHHOLE, &punchhole_args) == -1) {
+				copyfile_warn("unable to punch trailing hole in destination file, offset %lld",
+							  hole_start - src_start + dst_start);
+				goto set_total_copied;
+			}
+		}
+	}
+
+set_total_copied:
+	// Since we don't know in advance how many bytes we're copying, we advance this number
+	// as we copy, but to match copyfile_data() we set it here to the amount of bytes that would
+	// have been transferred in a full copy.
+	s->totalCopied = src_size - src_start;
+
+exit:
+	if (bp) {
+		free(bp);
+		bp = NULL;
+	}
+
+	return rc;
+
+error_exit:
+	s->err = errno;
+	rc = -1;
+	goto exit;
+}
+
+/*
  * Attempt to copy the data section of a file.  Using blockisize
  * is not necessarily the fastest -- it might be desirable to
  * specify a blocksize, somehow.  But it's a size that should be
@@ -2031,9 +2330,9 @@ static int copyfile_data(copyfile_state_t s)
 	char *bp = 0;
 	ssize_t nread;
 	int ret = 0;
-	size_t iBlocksize = 0;
-	size_t oBlocksize = 0;
-	const size_t onegig = 1 << 30;
+	size_t iBlocksize = 0, iMinblocksize = 0;
+	size_t oBlocksize = 0, oMinblocksize = 0; // If 0, we don't support sparse copying.
+	const size_t blocksize_limit = 1 << 30; // 1 GiB
 	struct statfs sfs;
 	copyfile_callback_t status = s->statuscb;
 
@@ -2053,42 +2352,99 @@ static int copyfile_data(copyfile_state_t s)
 	}
 #endif
 
+	// Calculate the input and output block sizes.
+	// Our output block size can be no greater than our input block size.
 	if (fstatfs(s->src_fd, &sfs) == -1) {
 		iBlocksize = s->sb.st_blksize;
 	} else {
 		iBlocksize = sfs.f_iosize;
+		iMinblocksize = sfs.f_bsize;
 	}
 
-	/* Work-around for 6453525, limit blocksize to 1G */
-	if (iBlocksize > onegig) {
-		iBlocksize = onegig;
+	if (fstatfs(s->dst_fd, &sfs) == -1) {
+		oBlocksize = iBlocksize;
+	} else {
+		oBlocksize = (sfs.f_iosize == 0) ? iBlocksize : MIN((size_t) sfs.f_iosize, iBlocksize);
+		oMinblocksize = sfs.f_bsize;
+	}
+
+	// 6453525 and 34848916 require us to limit our blocksize to resonable values.
+	if ((size_t) s->sb.st_size < iBlocksize && iMinblocksize > 0) {
+		copyfile_debug(3, "rounding up block size from fsize: %lld to multiple of %zu\n", s->sb.st_size, iMinblocksize);
+		iBlocksize = roundup((size_t) s->sb.st_size, iMinblocksize);
+		oBlocksize = MIN(oBlocksize, iBlocksize);
+	}
+
+	if (iBlocksize > blocksize_limit) {
+		iBlocksize = blocksize_limit;
+		oBlocksize = MIN(oBlocksize, iBlocksize);
+	}
+
+	copyfile_debug(3, "input block size: %zu output block size: %zu\n", iBlocksize, oBlocksize);
+
+	s->totalCopied = 0;
+
+	// If requested, attempt a sparse copy.
+	if (s->flags & COPYFILE_DATA_SPARSE) {
+		// Check if the source & destination volumes both support sparse files.
+		long min_hole_size = MIN(fpathconf(s->src_fd, _PC_MIN_HOLE_SIZE),
+								 fpathconf(s->dst_fd, _PC_MIN_HOLE_SIZE));
+
+		// If holes are supported on both the source and dest volumes, make sure our min_hole_size
+		// is reasonable: if it's smaller than the source/dest block size,
+		// our copy performance will suffer (and we may not create sparse files).
+		if (iMinblocksize > 0 && oMinblocksize > 0 && (size_t) min_hole_size >= iMinblocksize
+			&& (size_t) min_hole_size >= oMinblocksize) {
+			// Do the copy.
+			ret = copyfile_data_sparse(s, iMinblocksize, oMinblocksize);
+
+			// If we returned an error, exit gracefully.
+			// If sparse copying is not supported, we try full copying if allowed by our caller.
+			if (ret == 0) {
+				goto exit;
+			} else if (ret != ENOTSUP) {
+				goto exit;
+			}
+			ret = 0;
+		}
+
+		// Make sure we're allowed to perform non-sparse copying.
+		if (!(s->flags & COPYFILE_DATA)) {
+			ret = -1;
+			errno = ENOTSUP;
+			goto exit;
+		}
 	}
 
 	if ((bp = malloc(iBlocksize)) == NULL)
 		return -1;
 
-	if (fstatfs(s->dst_fd, &sfs) == -1 || sfs.f_iosize == 0) {
-		oBlocksize = iBlocksize;
-	} else {
-		oBlocksize = sfs.f_iosize;
-		if (oBlocksize > onegig)
-			oBlocksize = onegig;
-	}
-
 	blen = iBlocksize;
 
-	s->totalCopied = 0;
-	/* If supported, do preallocation for Xsan / HFS volumes */
+	/* If supported, do preallocation for Xsan / HFS / apfs volumes */
 #ifdef F_PREALLOCATE
 	{
-		fstore_t fst;
+		off_t dst_bytes_allocated = 0;
+		struct stat dst_sb;
 
-		fst.fst_flags = 0;
-		fst.fst_posmode = F_PEOFPOSMODE;
-		fst.fst_offset = 0;
-		fst.fst_length = s->sb.st_size;
-		/* Ignore errors; this is merely advisory. */
-		(void)fcntl(s->dst_fd, F_PREALLOCATE, &fst);
+		if (fstat(s->dst_fd, &dst_sb) == 0) {
+			// The destination may already have
+			// preallocated space we can use.
+			dst_bytes_allocated = dst_sb.st_blocks * S_BLKSIZE;
+		}
+
+		if (dst_bytes_allocated < s->sb.st_size) {
+			fstore_t fst;
+
+			fst.fst_flags = 0;
+			fst.fst_posmode = F_PEOFPOSMODE;
+			fst.fst_offset = 0;
+			fst.fst_length = s->sb.st_size - dst_bytes_allocated;
+
+			copyfile_debug(3, "preallocating %lld bytes on destination", fst.fst_length);
+			/* Ignore errors; this is merely advisory. */
+			(void)fcntl(s->dst_fd, F_PREALLOCATE, &fst);
+		}
 	}
 #endif
 
@@ -2345,6 +2701,8 @@ error_exit:
 /*
  * Attempt to set the destination file's stat information -- including
  * flags and time-related fields -- to the source's.
+ * Note that we must set file flags *last*, as setting a flag like
+ * UF_IMMUTABLE can prevent us from setting other attributes.
  */
 static int copyfile_stat(copyfile_state_t s)
 {
@@ -2357,6 +2715,20 @@ static int copyfile_stat(copyfile_state_t s)
 		struct timespec acc_time;
 	} ma_times;
 
+	/* Try to set m/atimes using setattrlist(), for nanosecond precision. */
+	memset(&attrlist, 0, sizeof(attrlist));
+	attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
+	attrlist.commonattr = ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME;
+	ma_times.mod_time = s->sb.st_mtimespec;
+	ma_times.acc_time = s->sb.st_atimespec;
+	(void)fsetattrlist(s->dst_fd, &attrlist, &ma_times, sizeof(ma_times), 0);
+
+	/* If this fails, we don't care */
+	(void)fchown(s->dst_fd, s->sb.st_uid, s->sb.st_gid);
+
+	/* This may have already been done in copyfile_security() */
+	(void)fchmod(s->dst_fd, s->sb.st_mode & ~S_IFMT);
+
 	/*
 	 * NFS doesn't support chflags; ignore errors as a result, since
 	 * we don't return failure for this.
@@ -2365,31 +2737,16 @@ static int copyfile_stat(copyfile_state_t s)
 		added_flags |= UF_HIDDEN;
 
 	/*
-	 * We need to check if SF_RESTRICTED was set on the destination
-	 * by the kernel.  If it was, don't drop it.
+	 * We need to check if certain flags were set on the destination
+	 * by the kernel.  If they were, don't drop them.
 	 */
 	if (fstat(s->dst_fd, &dst_sb))
 		return -1;
-	if (dst_sb.st_flags & SF_RESTRICTED)
-		added_flags |= SF_RESTRICTED;
+	added_flags |= (dst_sb.st_flags & COPYFILE_PRESERVE_FLAGS);
 
 	/* Copy file flags, masking out any we don't want to preserve */
 	dst_flags = (s->sb.st_flags & ~COPYFILE_OMIT_FLAGS) | added_flags;
 	(void)fchflags(s->dst_fd, dst_flags);
-
-	/* If this fails, we don't care */
-	(void)fchown(s->dst_fd, s->sb.st_uid, s->sb.st_gid);
-
-	/* This may have already been done in copyfile_security() */
-	(void)fchmod(s->dst_fd, s->sb.st_mode & ~S_IFMT);
-
-	/* Try to set m/atimes using setattrlist(), for nanosecond precision. */
-	memset(&attrlist, 0, sizeof(attrlist));
-	attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
-	attrlist.commonattr = ATTR_CMN_MODTIME | ATTR_CMN_ACCTIME;
-	ma_times.mod_time = s->sb.st_mtimespec;
-	ma_times.acc_time = s->sb.st_atimespec;
-	(void)fsetattrlist(s->dst_fd, &attrlist, &ma_times, sizeof(ma_times), 0);
 
 	return 0;
 }
@@ -2623,9 +2980,16 @@ static int copyfile_xattr(copyfile_state_t s)
 		}
 		if (fsetxattr(s->dst_fd, name, xa_dataptr, xa_size, 0, look_for_decmpea) < 0)
 		{
-			if (s->statuscb)
+			int error = errno;
+			if (error == EPERM && strcmp(name, XATTR_ROOT_INSTALLED_NAME) == 0) {
+				//Silently ignore if we fail to set XATTR_ROOT_INSTALLED_NAME
+				errno = error;
+				continue;
+			}
+			else if (s->statuscb)
 			{
 				int rv;
+				error = errno;
 				if (s->xattr_name == NULL)
 					s->xattr_name = strdup(name);
 				rv = (*s->statuscb)(COPYFILE_COPY_XATTR, COPYFILE_ERR, s, s->src, s->dst, s->ctx);
@@ -2638,8 +3002,9 @@ static int copyfile_xattr(copyfile_state_t s)
 			}
 			else
 			{
+				errno = error;
 				ret = -1;
-				copyfile_warn("could not set attributes %s on destination file descriptor: %s", name, strerror(errno));
+				copyfile_warn("could not set attributes %s on destination file descriptor", name);
 				continue;
 			}
 		}
@@ -2840,6 +3205,9 @@ struct {char *s; int v;} opts[] = {
 	COPYFILE_OPTION(VERBOSE)
 	COPYFILE_OPTION(RECURSIVE)
 	COPYFILE_OPTION(DEBUG)
+	COPYFILE_OPTION(CLONE)
+	COPYFILE_OPTION(CLONE_FORCE)
+	COPYFILE_OPTION(DATA_SPARSE)
 	{NULL, 0}
 };
 
@@ -2884,9 +3252,6 @@ int main(int c, char *v[])
  *
  * Copyright (c) 2004 Apple Computer, Inc. All rights reserved.
  */
-
-
-#define offsetof(type, member)	((size_t)(&((type *)0)->member))
 
 #define	XATTR_MAXATTRLEN   (16*1024*1024)
 
@@ -3580,9 +3945,14 @@ static int copyfile_unpack(copyfile_state_t s)
 							goto exit;
 						}
 					}
-					if (fsetxattr(s->dst_fd, (char *)entry->name, dataptr, entry->length, 0, 0) == -1) {
+					//Silently ignore failure to set XATTR_ROOT_INSTALLED_NAME
+					int result = fsetxattr(s->dst_fd, (char *)entry->name, dataptr, entry->length, 0, 0);
+					int errorcode = errno;
+					if (result == -1 && !(errorcode == EPERM &&
+										 strcmp((char*)entry->name, XATTR_ROOT_INSTALLED_NAME) == 0)) {
+						errno = errorcode;
 						if (COPYFILE_VERBOSE & s->flags)
-							copyfile_warn("error %d setting attribute %s", errno, entry->name);
+							copyfile_warn("error %d setting attribute %s", errorcode, entry->name);
 						if (s->statuscb) {
 							int rv;
 
@@ -3602,6 +3972,7 @@ static int copyfile_unpack(copyfile_state_t s)
 						}
 					} else if (s->statuscb) {
 						int rv;
+						errno = errorcode;
 						s->xattr_name = strdup((char*)entry->name);
 						s->totalCopied = entry->length;
 						rv = (*s->statuscb)(COPYFILE_COPY_XATTR, COPYFILE_FINISH, s, s->src, s->dst, s->ctx);
@@ -3614,6 +3985,8 @@ static int copyfile_unpack(copyfile_state_t s)
 							s->err = ECANCELED;
 							goto exit;
 						}
+					} else {
+						errno = errorcode;
 					}
 				}
 			}
@@ -4050,10 +4423,10 @@ static int copyfile_pack(copyfile_state_t s)
 	filehdr->appledouble.version            = ADH_VERSION;
 	filehdr->appledouble.numEntries         = 2;
 	filehdr->appledouble.entries[0].type    = AD_FINDERINFO;
-	filehdr->appledouble.entries[0].offset  = (u_int32_t)offsetof(apple_double_header_t, finfo);
+	filehdr->appledouble.entries[0].offset  = (u_int32_t)__builtin_offsetof(apple_double_header_t, finfo);
 	filehdr->appledouble.entries[0].length  = FINDERINFOSIZE;
 	filehdr->appledouble.entries[1].type    = AD_RESOURCE;
-	filehdr->appledouble.entries[1].offset  = (u_int32_t)offsetof(apple_double_header_t, pad);
+	filehdr->appledouble.entries[1].offset  = (u_int32_t)__builtin_offsetof(apple_double_header_t, pad);
 	filehdr->appledouble.entries[1].length  = 0;
 	bcopy(ADH_MACOSX, filehdr->appledouble.filler, sizeof(filehdr->appledouble.filler));
 
