@@ -7,15 +7,70 @@
 #ifndef test_utils_h
 #define test_utils_h
 
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/acl.h>
+#include <sys/attr.h>
 #include <sys/errno.h>
+#include <sys/queue.h>
+#include <System/sys/content_protection.h>
+#include <TargetConditionals.h>
 
 #include "../copyfile.h"
 
-#include <TargetConditionals.h>
+typedef struct test {
+	const char		*t_name;
+	bool 			(*t_func)(const char *, size_t);
+	bool			t_asroot;
+	uint32_t		t_timeout_seconds;
+	LIST_ENTRY(test) t_list;
+} test_t;
+
+typedef struct tests {
+	LIST_HEAD(_tests, test) t_tests;
+	unsigned t_num;
+} tests_t;
+
+void register_test(test_t *);
+
+#define REGISTER_TEST(name, asroot, timeout_seconds) \
+	bool do_##name##_test(const char *, size_t); \
+	test_t _test_##name = { \
+		.t_name = #name, \
+		.t_func = do_##name##_test, \
+		.t_asroot = asroot, \
+		.t_timeout_seconds = timeout_seconds, \
+	}; \
+	static void __attribute__((constructor)) \
+	register_test_##name(void) \
+	{ \
+		register_test(&_test_##name); \
+	}
+
+#define TIMEOUT_MIN(minutes) ((minutes) * 60)
+
+#ifndef KB
+#define KB (1024U)
+#endif
+#ifndef MB
+#define MB (1024UL * KB)
+#endif
+#ifndef GB
+#define GB (1024ULL * MB)
+#endif
+#ifndef TB
+#define TB (1024ULL * GB)
+#endif
+
+#define TEST_DIR				"/tmp/copyfile_test"
+
+#define MIN_BLOCKSIZE_B			512
+#define DEFAULT_BLOCKSIZE_B		4096
+#define MAX_BLOCKSIZE_B			16384
 
 #define BSIZE_B					128
 #define MAX_DISK_IMAGE_SIZE_MB	1024
@@ -50,12 +105,15 @@ int create_hole_in_fd(int fd, off_t offset, off_t length);
 void write_compressible_data(int fd);
 void compress_file(const char *path, const char *type);
 void create_test_file_name(const char *dir, const char *postfix, int id, char *string_out);
+void set_up_test_dir(uint32_t *bsize_out);
+void sort_tests(tests_t *tests);
 
 #if TARGET_OS_OSX
 // Our disk image test functions.
 void disk_image_create(const char *fstype, const char *mount_path, size_t size_in_mb);
 void disk_image_destroy(const char *mount_path, bool allow_failure);
 #endif
+
 
 // Assertion functions/macros for tests.
 static inline void
@@ -117,6 +175,15 @@ assert_fail_(const char *file, int line, const char *assertion, ...)
 		if (lhs_ != rhs_)												\
 			assert_fail(lhs_str " (" fmt ") != " rhs_str " (" fmt ")",	\
 						lhs_, rhs_);									\
+	} while (0)
+
+#define assert_not_equal(lhs, rhs, fmt)									\
+	do {																\
+		typeof (lhs) lhs_ = (lhs);										\
+		typeof (lhs) rhs_ = (rhs);										\
+		if (lhs_ == rhs_)												\
+			assert_fail("%s (" fmt ") == %s (" fmt ")",					\
+						#lhs, lhs_, #rhs, rhs_);						\
 	} while (0)
 
 #define assert_equal_int(lhs, rhs)	assert_equal_(lhs, rhs, #lhs, #rhs, "%d")
@@ -185,5 +252,62 @@ static inline ssize_t check_io_(ssize_t res, ssize_t len, const char *file,
 		} while (eintr_ret_ == (error_val) && errno == EINTR);	\
 		eintr_ret_;												\
 	})
+
+/*
+ * Return the protection class for `path'.
+ *
+ * Any error will be associated with `line' in the source.
+ */
+static inline uint32_t
+getclass_(const char *path, int line)
+{
+#define fail(...) assert_fail_(__FILE_NAME__, line, ##__VA_ARGS__)
+	static const struct attrlist req = {
+		.bitmapcount = ATTR_BIT_MAP_COUNT,
+		.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_DATA_PROTECT_FLAGS
+	};
+
+	struct {
+		uint32_t len;
+		attribute_set_t returned;
+		uint32_t prot_class;
+	} __attribute__((packed, aligned(4))) attrs;
+
+	// get the class for `path'
+	if (getattrlist(path, (void *)&req, &attrs, sizeof(attrs),
+		FSOPT_NOFOLLOW) == -1) {
+		fail("getattrlist(%s, class) -> %d", path, errno);
+	}
+
+	// check some class was returned
+	if (attrs.len != sizeof(attrs)) {
+		fail("attrs len is %u != %zu", attrs.len, sizeof(attrs));
+	}
+	if (attrs.returned.commonattr != req.commonattr) {
+		fail("attrs returned %x != %x",
+			attrs.returned.commonattr, req.commonattr);
+	}
+
+	// check for a valid class: [_NONE, _F], excluding _E
+	const uint32_t c = attrs.prot_class;
+	if (!((PROTECTION_CLASS_DIR_NONE <= c) &&
+		(c <= PROTECTION_CLASS_CX)) || (c == PROTECTION_CLASS_E)) {
+		fail("invalid class returned %u for %s", c, path);
+	}
+	return c;
+#undef fail
+}
+
+#define getclass(f) getclass_((f), __LINE__)
+
+static inline int
+acl_compare_permset_np(acl_permset_t p1, acl_permset_t p2)
+{
+	struct pm { u_int32_t ap_perms; } *ps1, *ps2;
+	ps1 = (struct pm*) p1;
+	ps2 = (struct pm*) p2;
+
+	return ((ps1->ap_perms == ps2->ap_perms) ? 1 : 0);
+}
 
 #endif /* test_utils_h */

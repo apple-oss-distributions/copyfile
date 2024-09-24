@@ -10,11 +10,12 @@
 #include <sys/fcntl.h>
 #include <sys/xattr.h>
 
-#include "../copyfile.h"
 #include "../copyfile_private.h"
+#include "../xattr_flags.h"
 #include "../xattr_properties.h"
-#include "clone_test.h"
 #include "test_utils.h"
+
+REGISTER_TEST(clone_copy_intent, false, 30);
 
 #define XATTR_1_NAME	"com.apple.quarantine"
 #define XATTR_1_DATA	"dib"
@@ -31,7 +32,7 @@ static bool verify_test_xattrs(const char *dest_name) {
 }
 
 static int do_copy(const char *source_name, const char *dest_name, uint32_t flags) {
-	CopyOperationIntent_t intent = XATTR_OPERATION_INTENT_SHARE;
+	CopyOperationIntent_t intent = CopyOperationIntentShare;
 	copyfile_state_t cpf_state;
 	int error;
 
@@ -55,7 +56,6 @@ bool do_clone_copy_intent_test(const char *apfs_test_directory, __unused size_t 
 	// COPYFILE_CLONE also works as expected.
 	// (4) Re-do (3) but with COPYFILE_CLONE_FORCE, and verify
 	// that we fail in this case.
-	printf("START [clone_copy_intent]\n");
 
 	// Get ready for the test.
 	test_file_id = rand() % DEFAULT_NAME_MOD;
@@ -91,12 +91,6 @@ bool do_clone_copy_intent_test(const char *apfs_test_directory, __unused size_t 
 	assert_equal_int(do_copy(source_name, dest_name,
 		COPYFILE_ALL|COPYFILE_CLONE|COPYFILE_CLONE_FORCE), -1);
 	assert_equal_int(errno, ENOTSUP);
-
-	if (success) {
-		printf("PASS  [clone_copy_intent]\n");
-	} else {
-		printf("FAIL  [clone_copy_intent]\n");
-	}
 
 	// Post-test cleanup.
 	assert_no_err(close(source_fd));
