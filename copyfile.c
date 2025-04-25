@@ -765,6 +765,10 @@ copytree(copyfile_state_t s)
 		// append (fts_path + strlen(src)) to dst?
 		dstpathsep = "";
 		offset = strlen(src);
+		// if src ends with `/`, keep at least one `/` at the string pointed by src + offset
+		if (srcisdir && (offset > 0) && (src[offset - 1] == '/')) {
+			offset--;
+		}
 	}
 
 	/*
@@ -2165,7 +2169,8 @@ static int copyfile_open(copyfile_state_t s)
 		}
 
 		if (islnk) {
-			size_t sz = (size_t)s->sb.st_size + 1;
+			// some implementations may not populate the st_size for symbolic links
+			size_t sz = (size_t)(s->sb.st_size ? s->sb.st_size + 1 : PATH_MAX + 1);
 			char *bp;
 
 			bp = calloc(1, sz);
@@ -5131,6 +5136,7 @@ skip_fi:
 exit:
 	if (buffer) free(buffer);
 	if (dataptr) free(dataptr);
+	if (acl_dataptr) free(acl_dataptr);
 	return error;
 }
 
@@ -5696,6 +5702,7 @@ static int copyfile_pack(copyfile_state_t s)
 		}
 #endif
 		free(databuf);
+		databuf = NULL;
 
 		copyfile_debug(3, "copied %ld bytes of \"%s\" data @ offset 0x%08x", datasize, nameptr, entry->offset);
 	next:
@@ -5734,6 +5741,7 @@ static int copyfile_pack(copyfile_state_t s)
 exit:
 	if (filehdr) free(filehdr);
 	if (attrnamebuf) free(attrnamebuf);
+	if (databuf) free(databuf);
 
 	if (error)
 		return error;
